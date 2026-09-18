@@ -84,6 +84,36 @@ const WikiSummaryPrompt = `You are a wiki editor. Given the following document c
 
 Output the SUMMARY line first, then the Markdown content. Do not include any other preamble.`
 
+// WikiSummaryReducePrompt synthesizes one full-document wiki summary page
+// from the per-segment partial summaries produced by the map phase of the
+// multi-segment pipeline. The output contract mirrors WikiSummaryPrompt
+// exactly (leading "SUMMARY:" line + Markdown body with a trailing Key
+// Takeaways section) so splitSummaryLine consumes the result unchanged.
+const WikiSummaryReducePrompt = `You are a wiki editor. You are given partial summaries of a LONG document. Each partial summary covers one consecutive part (segment) of the full text; part numbers and the character range each part covers are attached. Synthesize ALL partial summaries into ONE structured wiki summary page covering the ENTIRE document, in Markdown format.
+
+<partial_summaries>
+{{.PartialSummaries}}
+</partial_summaries>
+
+<available_wiki_pages>
+{{.ExtractedSlugs}}
+</available_wiki_pages>
+
+<instructions>
+1. The FIRST line of your output MUST be: SUMMARY: {one sentence, 15-40 words, describing what the ENTIRE document is about — for wiki index listing}
+2. After the SUMMARY line, write a comprehensive summary of the ENTIRE document in Markdown format.
+3. **Cross-part dedup rule**: The same topic may be discussed in several parts. Merge such overlap and present each shared topic ONCE, in its most complete form.
+4. **Coverage rule**: Preserve topics that appear in only one part; do not drop segment-unique themes just because other parts do not mention them.
+5. **Grounding rule**: Use ONLY information present in the partial summaries above. Do NOT invent facts, arguments, names, or conclusions that no partial summary mentions.
+6. Use proper heading hierarchy (## for sections, ### for subsections).
+7. **Wiki-link rule**: The available_wiki_pages list above maps slugs to display names and their aliases (format: "[[slug]] = display name (Aliases: a, b)"). Whenever you mention a name or alias that matches a listed entry, you MUST write it as [[slug|display name]] (e.g. [[entity/zhong-guo|中国]]), NOT as bold (**name**) or bare [[slug]]. Use the EXACT slugs provided — do NOT invent new slugs.
+8. At the end, include a "## Key Takeaways" section with bullet points covering the whole document.
+9. Write in {{.Language}}.
+10. Keep the final summary concise but thorough (500-1500 words).
+</instructions>
+
+Output the SUMMARY line first, then the Markdown content. Do not include any other preamble.`
+
 // WikiKnowledgeExtractPrompt extracts both entities and concepts in a single LLM call.
 // Returns a JSON object with "entities" and "concepts" arrays.
 // This replaces the former separate WikiEntityExtractPrompt and WikiConceptExtractPrompt.
