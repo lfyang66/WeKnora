@@ -1,4 +1,11 @@
 <p align="center">
+  <a href="./docs/wiki-map-reduce.md"><strong>🧬 Wiki map-reduce 魔改版（本仓库分支 wiki-map-reduce）</strong></a><br/>
+  <sub>超长文档全量覆盖：wiki 管线 map-reduce 改造，538 万字符级长文档可完整进入 LLM 流程，字符/token 上限可调、中英文自适应。核心改动见 <a href="./docs/wiki-map-reduce.md">docs/wiki-map-reduce.md</a>。</sub>
+</p>
+
+---
+
+<p align="center">
   <picture>
     <img src="./docs/images/logo.png" alt="WeKnora Logo" height="120"/>
   </picture>
