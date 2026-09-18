@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"errors"
 	"net/http"
 	"os"
 	"strconv"
@@ -22,9 +23,30 @@ const (
 	// over a minute on slow endpoints, so this is intentionally generous and
 	// can be raised further via VLM_HTTP_TIMEOUT_SECONDS.
 	defaultTimeout = 180 * time.Second
-	defaultMaxToks = 5000
+	defaultMaxToks = 1024 // GLM-4V-Flash 上限1024（原5000，2026-09-16 OCR适配）
 	defaultTemp    = float32(0.1)
 )
+
+// isTransientVLMError reports whether a VLM API error is worth retrying:
+// rate limits (429), server-side errors (5xx) and transport timeouts.
+func isTransientVLMError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "status code: 429") ||
+		strings.Contains(msg, "status code: 5") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "EOF") {
+		return true
+	}
+	var apiErr *openai.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.HTTPStatusCode == 429 || apiErr.HTTPStatusCode >= 500
+	}
+	return false
+}
 
 // vlmHTTPTimeout returns the HTTP client timeout for VLM requests, read from
 // the VLM_HTTP_TIMEOUT_SECONDS env var when set (and positive), falling back to
@@ -152,7 +174,27 @@ func (v *RemoteAPIVLM) Predict(ctx context.Context, imgBytesList [][]byte, promp
 	logger.Infof(ctx, "[VLM] Calling OpenAI-compatible API, model=%s, baseURL=%s, numImages=%d, totalImageSize=%d",
 		v.modelName, v.baseURL, len(imgBytesList), totalImageSize)
 
-	resp, err := v.client.CreateChatCompletion(ctx, req)
+	// [local-build 2026-09-16] retry transient failures (429 rate limit / 5xx)
+	// with exponential backoff — free-tier VLM endpoints reject bursts, and a
+	// single failed call silently drops that image's OCR chunk forever.
+	var resp openai.ChatCompletionResponse
+	var err error
+	for attempt := 0; ; attempt++ {
+		resp, err = v.client.CreateChatCompletion(ctx, req)
+		if err == nil {
+			break
+		}
+		if !isTransientVLMError(err) || attempt >= 3 {
+			break
+		}
+		backoff := time.Duration(2<<attempt) * time.Second // 2s, 4s, 8s
+		logger.Warnf(ctx, "[VLM] transient error (attempt %d/3), retrying in %v: %v", attempt+1, backoff, err)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return "", fmt.Errorf("OpenAI VLM request canceled during retry: %w", ctx.Err())
+		}
+	}
 	if err != nil {
 		return "", fmt.Errorf("OpenAI VLM request: %w", err)
 	}

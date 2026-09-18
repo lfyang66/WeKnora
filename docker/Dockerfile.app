@@ -1,10 +1,8 @@
 # Build the paired extension and fetch the checksum-pinned native daemon.
 # Node runs on the builder architecture; only bsk targets the runtime image.
-FROM --platform=$BUILDPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS browserskill
+# [local-build] node:24-bookworm (non-slim) ships git/python3/ca-certificates; apt-get skipped (GPG broken in this env)
+FROM --platform=$BUILDPLATFORM node:24-bookworm AS browserskill
 WORKDIR /build
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends git python3 ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
 COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
 COPY patches/browserskill ./patches/browserskill
 ARG TARGETOS
@@ -28,11 +26,7 @@ ENV GOPROXY=${GOPROXY_ARG}
 ENV GOSUMDB=${GOSUMDB_ARG}
 
 # Install dependencies
-RUN if [ -n "$APK_MIRROR_ARG" ]; then \
-        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
-    fi && \
-    apt-get update && \
-    apt-get install -y git build-essential libsqlite3-dev curl
+RUN echo "[local-build] skip apt-get: golang image ships git/gcc/make/curl; libsqlite3-dev handled below if needed"
 
 # Install migrate tool
 RUN go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
@@ -69,10 +63,22 @@ ENV PATH=/usr/local/cargo/bin:$PATH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     if [ "$WITH_ANYDOC" = "1" ]; then \
+        mkdir -p "$CARGO_HOME" && \
+        printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' > "$CARGO_HOME/config.toml" && \
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable && \
+            | RUSTUP_DIST_SERVER=https://rsproxy.cn RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup sh -s -- -y --profile minimal --default-toolchain stable && \
         ./scripts/build-anydoc-lib.sh; \
     fi
+
+# [local-build] provide sqlite3.h from mattn/go-sqlite3 amalgamation (libsqlite3-dev not installed)
+RUN --mount=type=cache,target=/go/pkg/mod \
+    find /go/pkg/mod/github.com/mattn -name "sqlite3-binding.h" 2>/dev/null | head -1 > /tmp/hdr; \
+    if [ ! -s /tmp/hdr ]; then \
+        echo "[local-build] mod cache empty, downloading mattn/go-sqlite3"; \
+        go mod download github.com/mattn/go-sqlite3; \
+        find /go/pkg/mod/github.com/mattn -name "sqlite3-binding.h" | head -1 > /tmp/hdr; \
+    fi; \
+    cp "$(cat /tmp/hdr)" /usr/include/sqlite3.h && ls -la /usr/include/sqlite3.h
 
 # Build the application with version info
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -99,30 +105,11 @@ COPY --from=browserskill /opt/weknora/browserskill /opt/weknora/browserskill
 RUN useradd -m -s /bin/bash appuser
 
 # First, install ca-certificates without mirror to ensure HTTPS works
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# [local-build] CA bundle copied from builder (apt skipped: GPG broken in this env)
+COPY --from=builder /etc/ssl/certs /etc/ssl/certs
 
 # Then switch to mirror if specified and install other packages
-RUN if [ -n "$APK_MIRROR_ARG" ]; then \
-        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
-    fi && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        build-essential postgresql-client default-mysql-client tzdata sed curl bash vim wget \
-        libsqlite3-0 \
-        python3 python3-pip python3-dev libffi-dev libssl-dev \
-        nodejs npm \
-        gosu \
-        ffmpeg && \
-    python3 -m pip install --break-system-packages --upgrade pip setuptools wheel && \
-    mkdir -p /home/appuser/.local/bin && \
-    curl -LsSf https://astral.sh/uv/install.sh | CARGO_HOME=/home/appuser/.cargo UV_INSTALL_DIR=/home/appuser/.local/bin sh && \
-    chown -R appuser:appuser /home/appuser && \
-    ln -sf /home/appuser/.local/bin/uvx /usr/local/bin/uvx && \
-    chmod +x /usr/local/bin/uvx && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+# [local-build] sandbox toolchain (python3/node/ffmpeg/uv) skipped — minimal KB deployment; reinstall via apt if sandbox needed
 
 # Create data directories and set permissions
 RUN mkdir -p /data/files && \
@@ -138,6 +125,8 @@ COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/migrations ./migrations
 COPY --from=builder /app/dataset/samples ./dataset/samples
 COPY --from=builder /root/.duckdb /home/appuser/.duckdb
+# [local-build 2026-09-16] root runtime (gosu removed) reads HOME=/root
+COPY --from=builder /root/.duckdb /root/.duckdb
 COPY --from=builder /app/WeKnora .
 COPY LICENSE THIRD_PARTY_NOTICES.md ./
 COPY licenses ./licenses

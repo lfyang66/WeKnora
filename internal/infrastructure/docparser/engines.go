@@ -225,7 +225,7 @@ func (e *mineruCloudEngine) CheckAvailable(_ bool, overrides map[string]string) 
 	if apiKey == "" {
 		return false, "MinerU API Key not configured"
 	}
-	return PingMinerUCloud(apiKey)
+	return PingMinerUCloud(apiKey, overrides["mineru_endpoint"])
 }
 
 func (e *mineruCloudEngine) NewReader(_ context.Context, deps ReaderDeps) (interfaces.DocReader, error) {

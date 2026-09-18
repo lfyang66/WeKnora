@@ -34,10 +34,12 @@ services:
     restart: unless-stopped
 
   app:
-    image: wechatopenai/weknora-app:${WEKNORA_VERSION:-latest}
+    # [local-build 2026-09-16] ocr-local: defaultMaxToks 5000→1024 (GLM-4V-Flash), no sandbox toolchain; source patch /tmp/remote_api.go.bak
+    image: wechatopenai/weknora-app:ocr-local
     build:
       context: .
       dockerfile: docker/Dockerfile.app
+      network: host
       args:
         - APK_MIRROR_ARG=${APK_MIRROR_ARG:-}
         - WITH_ANYDOC=${WITH_ANYDOC:-1}
@@ -57,7 +59,8 @@ services:
       # uncomment the line below. See docs/BUILTIN_MODELS.md.
       # - ./config/builtin_models.yaml:/app/config/builtin_models.yaml:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      # [local-build 2026-09-16] curl removed in minimal image; TCP probe instead
+      test: ["CMD-SHELL", 'bash -c "exec 3<>/dev/tcp/127.0.0.1/8080"']
       interval: 30s
       timeout: 10s
       retries: 3
@@ -75,6 +78,11 @@ services:
     env_file:
       - .env
     environment:
+      # ========== 统一出站代理（2026-09-18 阶段2 灰度，方案见 WeKnora统一出站方案.md）==========
+      - HTTP_PROXY=http://172.17.0.1:18080
+      - HTTPS_PROXY=http://172.17.0.1:18080
+      # 豁免：本地服务 + MinerU 三域名（仍走 socat 中转，阶段3 再迁）
+      - NO_PROXY=localhost,127.0.0.1,host.docker.internal,postgres,redis,searxng,qdrant,milvus,weaviate,doris-fe,doris-be,minio,mineru.net,mineru.oss-cn-shanghai.aliyuncs.com,cdn-mineru.openxlab.org.cn,172.18.0.0/16
       # ========== 日志 ==========
       # 日志级别，默认debug
       - LOG_LEVEL=${LOG_LEVEL:-debug}
@@ -380,6 +388,16 @@ services:
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      # 统一出站 2026-09-18 阶段2: LLM 域名(api.deepseek.com/open.bigmodel.cn/llm.goaichat.top/
+      # daapsaak.top)的 host-gateway 钉扎移除，改经 HTTPS_PROXY 走 gost 统一代理(172.17.0.1:18080)，
+      # models base_url 已还原标准 443。回滚：撤代理变量+还原钉扎+base_url 加回端口（方案 §6）。
+      # MinerU Cloud 2026-09-18: bridge 出站到阿里云 IP(47.117.160.189)被墙，
+      # socat-mineru 容器(8445→mineru.net:443)四层转发，SSRF_WHITELIST 已含 172.17.0.1/32。
+      - "mineru.net:host-gateway"
+      # MinerU OSS 上传/结果下载走同一中转（batch file_urls 是 oss-cn-shanghai 桶）
+      - "mineru.oss-cn-shanghai.aliyuncs.com:host-gateway"
+      # MinerU 解析结果 zip CDN
+      - "cdn-mineru.openxlab.org.cn:host-gateway"
 
   # Sandbox 镜像：仅用于 build/pull，非常驻。Docker 沙箱默认关闭，需
   # WEKNORA_SANDBOX_DOCKER_ENABLED=true 并挂载 docker.sock 后，app 才会按会话创建容器。
@@ -400,6 +418,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.docreader
+      network: host
       args:
         - APT_MIRROR=${APT_MIRROR:-}
     container_name: WeKnora-docreader
@@ -633,9 +652,12 @@ services:
       - NEO4J_apoc_import_file_enabled=true
       - NEO4J_apoc_import_file_use__neo4j__config=true
       - NEO4JLABS_PLUGINS=["apoc"]
-    ports:
-      - "7474:7474"
-      - "7687:7687"
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=1g
+      - NEO4J_server_memory_pagecache_size=512m
+    # ports:  # app 走容器内网 bolt://neo4j:7687，宿主机映射不需要，避免公网暴露
+    #   - "7474:7474"
+    #   - "7687:7687"
     restart: always
     networks:
       - WeKnora-network

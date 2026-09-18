@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -40,10 +43,12 @@ type MinerUCloudReader struct {
 }
 
 // NewMinerUCloudReader creates a reader from ParserEngineOverrides.
+// baseURL comes from overrides["mineru_endpoint"] (e.g. https://mineru.net:8445/api/v4
+// when a local socat relay fronts mineru.net:443); it falls back to defaultBaseURL.
 func NewMinerUCloudReader(overrides map[string]string) *MinerUCloudReader {
 	return &MinerUCloudReader{
 		apiKey:        strings.TrimSpace(overrides["mineru_api_key"]),
-		baseURL:       defaultBaseURL,
+		baseURL:       stringOr(strings.TrimSpace(overrides["mineru_endpoint"]), defaultBaseURL),
 		model:         stringOr(overrides["mineru_cloud_model"], "pipeline"),
 		formulaEnable: parseBoolOr(overrides["mineru_cloud_enable_formula"], true),
 		tableEnable:   parseBoolOr(overrides["mineru_cloud_enable_table"], true),
@@ -163,8 +168,47 @@ func (c *MinerUCloudReader) applyUploadURLs(ctx context.Context, fileName, ext s
 	return result.Data.BatchID, result.Data.FileURLs[0], nil
 }
 
+// relayOSSURL rewrites a MinerU Cloud asset URL (OSS upload bucket, result
+// CDN) to go through the local socat relay port (MINERU_OSS_RELAY_PORT, e.g.
+// 8446) when set. Batch file_urls and full_zip_url returned by MinerU Cloud
+// point at hosts whose direct egress is blocked on this deployment and the
+// host 443 is occupied, so socat containers on the host network front them
+// and extra_hosts pin their hostnames to the docker gateway. The hostname
+// (and thus TLS SNI/certificate validation) is kept unchanged. Relay targets
+// come from MINERU_RELAY_HOSTS (comma-separated) and default to the OSS
+// upload bucket and the openxlab result CDN. Empty env or unmatched hosts
+// return the URL unchanged.
+func relayOSSURL(rawURL string) string {
+	port := strings.TrimSpace(os.Getenv("MINERU_OSS_RELAY_PORT"))
+	if port == "" {
+		return rawURL
+	}
+	relayHosts := []string{"mineru.oss-cn-shanghai.aliyuncs.com:8446", "cdn-mineru.openxlab.org.cn:8447"}
+	if extra := strings.TrimSpace(os.Getenv("MINERU_RELAY_HOSTS")); extra != "" {
+		relayHosts = strings.Split(extra, ",")
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return rawURL
+	}
+	host := u.Hostname()
+	targetPort := ""
+	for _, entry := range relayHosts {
+		h, p, hasPort := strings.Cut(strings.TrimSpace(entry), ":")
+		if hasPort && strings.EqualFold(h, host) {
+			targetPort = p
+			break
+		}
+	}
+	if targetPort == "" {
+		return rawURL
+	}
+	u.Host = net.JoinHostPort(host, targetPort)
+	return u.String()
+}
+
 func (c *MinerUCloudReader) uploadFile(ctx context.Context, uploadURL string, content []byte) error {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(content))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, relayOSSURL(uploadURL), bytes.NewReader(content))
 	if err != nil {
 		return fmt.Errorf("create PUT request: %w", err)
 	}
@@ -357,7 +401,7 @@ func downloadAndExtractZip(zipURL string) (string, []types.ImageRef, error) {
 		return "", nil, fmt.Errorf("zip URL blocked by SSRF check: %v", err)
 	}
 	client := utils.NewSSRFSafeHTTPClient(utils.SSRFSafeHTTPClientConfig{Timeout: 120 * time.Second, MaxRedirects: 5})
-	resp, err := client.Get(zipURL)
+	resp, err := client.Get(relayOSSURL(zipURL))
 	if err != nil {
 		return "", nil, fmt.Errorf("download zip: %w", err)
 	}
@@ -485,13 +529,14 @@ func readZipEntryBytes(f *zip.File) ([]byte, error) {
 }
 
 // PingMinerUCloud checks if the MinerU Cloud API is reachable with the given API key.
-func PingMinerUCloud(apiKey string) (bool, string) {
+// endpoint may be empty to use defaultBaseURL.
+func PingMinerUCloud(apiKey, endpoint string) (bool, string) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return false, "未配置 MinerU Cloud API Key"
 	}
 
-	targetURL := defaultBaseURL + "/file-urls/batch"
+	targetURL := stringOr(strings.TrimSpace(endpoint), defaultBaseURL) + "/file-urls/batch"
 	payload := []byte(`{"files":[],"model_version":"pipeline"}`)
 	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(payload))
 	if err != nil {

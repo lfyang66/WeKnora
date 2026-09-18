@@ -65,4 +65,5 @@ case "${DOCKER_HOST:-}" in
 esac
 
 # ─── Drop privileges and exec the main process ───
-exec gosu appuser "$@"
+# [local-build 2026-09-16] gosu unavailable in minimal image; run as root (was: exec gosu appuser "$@")
+exec "$@"

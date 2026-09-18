@@ -244,6 +244,101 @@ class MarkdownTableFormatter(BaseParser):
         return Document(content=text)
 
 
+class MarkdownParagraphRefolder(BaseParser):
+    """Re-fold hard-wrapped plain text into paragraphs.
+
+    Print-originated plain text (Project Gutenberg dumps, OCR TXT exports,
+    web clipping with fixed-width wrapping) breaks every line at a fixed
+    column. Without re-folding, downstream chunking produces one chunk per
+    printed line. Lines belonging to the same paragraph are joined until a
+    blank line or a structural element (heading, list, table row, fenced
+    code, HTML comment, image/link line, indented block) is met.
+
+    Joining rules:
+    - trailing hard hyphen + lowercase continuation -> de-hyphenated join
+    - CJK-adjacent lines -> joined without a space
+    - everything else -> joined with a single space
+
+    Structural elements are never merged, so Markdown semantics (headings,
+    tables, lists, code fences) are preserved.
+    """
+
+    _CJK_RE = re.compile(r"[\u3000-\u9fff\uf900-\ufaff]")
+    _STRUCT_RE = re.compile(
+        r"^(#{1,6}\s|>|\||[-*+]\s|\d{1,3}[.)]\s|!\[|\[.{0,120}\]\(|`{3,}|<!--|-->|\s{4,}\S)"
+    )
+
+    @classmethod
+    def _is_structural(cls, line: str) -> bool:
+        s = line.strip()
+        return bool(s) and bool(cls._STRUCT_RE.match(s))
+
+    @classmethod
+    def _refold(cls, text: str) -> str:
+        if not text or "\n" not in text:
+            return text
+        out: list = []
+        buf: list = []
+        in_fence = False
+        in_comment = False
+
+        def flush():
+            if buf:
+                out.append("".join(buf).strip())
+                buf.clear()
+
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                flush()
+                in_fence = not in_fence
+                out.append(line)
+                continue
+            if in_fence:
+                out.append(line)
+                continue
+            if not in_comment and "<!--" in line and "-->" not in line:
+                flush()
+                in_comment = True
+                out.append(line)
+                continue
+            if in_comment:
+                if "-->" in line:
+                    in_comment = False
+                out.append(line)
+                continue
+            if not stripped or cls._is_structural(line):
+                flush()
+                out.append(line)
+                continue
+            if not buf:
+                buf.append(stripped)
+                continue
+            prev = buf[-1]
+            if prev.endswith("-") and stripped[:1].islower():
+                buf[-1] = prev[:-1]
+            elif cls._CJK_RE.search(prev[-1:]) or cls._CJK_RE.search(stripped[:1]):
+                pass
+            else:
+                buf[-1] = prev + " "
+            buf[-1] += stripped
+        flush()
+        return "\n".join(out)
+
+    def parse_into_text(self, content: bytes) -> Document:
+        """Re-fold hard-wrapped paragraphs in Markdown content.
+
+        Args:
+            content: Raw Markdown content as bytes
+
+        Returns:
+            Document with re-folded paragraph content
+        """
+        text = endecode.decode_bytes(content)
+        text = self._refold(text)
+        return Document(content=text)
+
+
 class MarkdownImageUtil:
     """Utility class for handling images in Markdown.
 
@@ -468,7 +563,7 @@ class MarkdownParser(PipelineParser):
     with each stage's output becoming the next stage's input.
     """
 
-    _parser_cls = (MarkdownTableFormatter, MarkdownImageBase64)
+    _parser_cls = (MarkdownTableFormatter, MarkdownImageBase64, MarkdownParagraphRefolder)
 
 
 if __name__ == "__main__":
