@@ -298,6 +298,37 @@ var registry = map[string]settingSpec{
 			"每次调用实时读取，修改后立即生效、无需重启。0 或负数表示关闭默认限制" +
 			"（各模型仍会尊重自身在模型管理里配置的上限）。仅影响后台任务，不影响交互式对话。",
 	},
+
+	// wiki.segment_max_chars is the manual per-segment character cap for the
+	// wiki multi-segment (map-reduce) extraction of very long documents.
+	// Read live at every ingest run - UI edits take effect immediately, no
+	// restart needed. Mirrors WEKNORA_WIKI_SEGMENT_MAX_CHARS (default 200000).
+	"wiki.segment_max_chars": {
+		Type:     "int",
+		EnvName:  "WEKNORA_WIKI_SEGMENT_MAX_CHARS",
+		Default:  int64(200000),
+		Category: "wiki",
+		Description: "Wiki 多段抽取的单段字符上限（手动模式）。文档正文超过该值时按 chunk 边界" +
+			"切分为多个段落分别抽取实体，避免超长文档被截断丢弃。每次调用实时读取，" +
+			"UI 修改立即生效、无需重启。最小值 10000。",
+	},
+
+	// wiki.segment_token_budget enables the automatic (language-aware) segment
+	// budget mode. 0 = disabled (manual wiki.segment_max_chars applies as-is);
+	// when > 0 the segment char cap is derived from the content's CJK density
+	// (about 0.65 tokens/char for Chinese, 0.25 for English), so one
+	// configuration serves both Chinese and English books.
+	// Mirrors WEKNORA_WIKI_SEGMENT_TOKEN_BUDGET (default 0 = off).
+	"wiki.segment_token_budget": {
+		Type:     "int",
+		EnvName:  "WEKNORA_WIKI_SEGMENT_TOKEN_BUDGET",
+		Default:  int64(0),
+		Category: "wiki",
+		Description: "Wiki 多段抽取的 token 预算（自动模式）。0=关闭；大于 0 时按内容语言密度" +
+			"自动换算段字符上限（中英自适应：中文约 0.65、英文约 0.25 token/字符），" +
+			"一次配置即可同时适配中英文书籍，无需人工切换。每次调用实时读取，" +
+			"UI 修改立即生效、无需重启。",
+	},
 }
 
 // systemSettingService wires the repository, audit log, and (P2)
@@ -1320,6 +1351,29 @@ func validateRegistryEntry(key string, rawValue any) error {
 		}
 		if n < 1 {
 			return errors.New("concurrency must be at least 1")
+		}
+	case "wiki.segment_max_chars":
+		// Segment cap for the wiki map-reduce extraction. Below ~10000 chars
+		// a "segment" stops being a meaningful map unit (prompt overhead
+		// dominates and the reduce step explodes), so reject smaller values
+		// instead of silently producing junk.
+		n, err := coerceToPositiveInt64(rawValue)
+		if err != nil {
+			return err
+		}
+		if n < 10000 {
+			return errors.New("wiki.segment_max_chars 单段字符上限不能小于 10000")
+		}
+	case "wiki.segment_token_budget":
+		// 0 disables the automatic (language-density) mode; any nonzero value
+		// below 30000 tokens would clamp to the 50000-char floor anyway, which
+		// only confuses operators - reject it explicitly.
+		n, err := coerceToPositiveInt64(rawValue)
+		if err != nil {
+			return err
+		}
+		if n != 0 && n < 30000 {
+			return errors.New("wiki.segment_token_budget 必须为 0（关闭自动模式）或不小于 30000")
 		}
 	case "ssrf.whitelist":
 		// Coerce into the same shape encodeForType produced. We don't

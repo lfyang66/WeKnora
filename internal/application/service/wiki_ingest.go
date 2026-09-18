@@ -361,14 +361,19 @@ type WikiPendingOp struct {
 // both of which are correctness-critical short-lived flags rather
 // than data the system should survive without.
 type wikiIngestService struct {
-	wikiService    interfaces.WikiPageService
-	kbService      interfaces.KnowledgeBaseService
-	knowledgeSvc   interfaces.KnowledgeService
-	knowledgeRepo  interfaces.KnowledgeRepository
-	chunkRepo      interfaces.ChunkRepository
-	modelService   interfaces.ModelService
-	task           interfaces.TaskEnqueuer
-	audit          interfaces.AuditLogService
+	wikiService   interfaces.WikiPageService
+	kbService     interfaces.KnowledgeBaseService
+	knowledgeSvc  interfaces.KnowledgeService
+	knowledgeRepo interfaces.KnowledgeRepository
+	chunkRepo     interfaces.ChunkRepository
+	modelService  interfaces.ModelService
+	task          interfaces.TaskEnqueuer
+	audit         interfaces.AuditLogService
+	// systemSettings resolves the wiki segment tunables
+	// (wiki.segment_max_chars / wiki.segment_token_budget). May be nil in
+	// unit tests / Lite builds - segmentConfig degrades to the built-in
+	// defaults in that case.
+	systemSettings interfaces.SystemSettingService
 	pendingRepo    interfaces.TaskPendingOpsRepository
 	deadLetterRepo interfaces.TaskDeadLetterRepository
 	redisClient    *redis.Client // nil in Lite mode (no Redis)
@@ -409,6 +414,7 @@ func NewWikiIngestService(
 	modelService interfaces.ModelService,
 	task interfaces.TaskEnqueuer,
 	audit interfaces.AuditLogService,
+	systemSettings interfaces.SystemSettingService,
 	pendingRepo interfaces.TaskPendingOpsRepository,
 	deadLetterRepo interfaces.TaskDeadLetterRepository,
 	redisClient *redis.Client,
@@ -423,12 +429,38 @@ func NewWikiIngestService(
 		modelService:   modelService,
 		task:           task,
 		audit:          audit,
+		systemSettings: systemSettings,
 		pendingRepo:    pendingRepo,
 		deadLetterRepo: deadLetterRepo,
 		redisClient:    redisClient,
 		spanTracker:    spanTracker,
 	}
 	return svc
+}
+
+// segmentConfig resolves the wiki multi-segment tunables from system
+// settings with the standard DB > ENV > default priority. The defaults
+// mirror the registry entries (wiki.segment_max_chars / wiki.segment_token_budget)
+// so the two stay visually adjacent for future maintainers:
+//   - maxChars: manual per-segment character cap (stage-1 parity with the
+//     historical truncation behaviour that mapOneDocument used to apply).
+//   - tokenBudget: 0 disables the automatic language-density mode; when > 0
+//     estimateSegmentCharBudget derives the effective char cap from the
+//     content's CJK ratio, so one setting fits both Chinese and English books.
+//
+// A nil systemSettings (unit tests / Lite builds) degrades gracefully to the
+// defaults instead of panicking.
+func (s *wikiIngestService) segmentConfig(ctx context.Context) (maxChars int, tokenBudget int) {
+	const (
+		defMaxChars    = int64(200000) // keep in sync with registry wiki.segment_max_chars
+		defTokenBudget = int64(0)      // keep in sync with registry wiki.segment_token_budget
+	)
+	if s.systemSettings == nil {
+		return int(defMaxChars), int(defTokenBudget)
+	}
+	maxChars = int(s.systemSettings.GetInt(ctx, "wiki.segment_max_chars", "WEKNORA_WIKI_SEGMENT_MAX_CHARS", defMaxChars))
+	tokenBudget = int(s.systemSettings.GetInt(ctx, "wiki.segment_token_budget", "WEKNORA_WIKI_SEGMENT_TOKEN_BUDGET", defTokenBudget))
+	return maxChars, tokenBudget
 }
 
 // tracker returns a non-nil span tracker so callers don't have to
