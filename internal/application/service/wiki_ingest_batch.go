@@ -1198,10 +1198,15 @@ func (s *wikiIngestService) mapOneDocument(
 
 	content := reconstructEnrichedContent(ctx, s.chunkRepo, payload.TenantID, chunks)
 	rawRuneCount := len([]rune(content))
-	if len([]rune(content)) > maxContentForWiki {
-		content = string([]rune(content)[:maxContentForWiki])
+	// Truncation now only caps the retractStale context (RetractDocContent,
+	// design decision unchanged): extraction and summary consume the full
+	// content, or per-segment slices once the document exceeds the segment
+	// budget decided by planSegmentation below.
+	retractContent := content
+	if rawRuneCount > maxContentForWiki {
+		retractContent = string([]rune(content)[:maxContentForWiki])
 	}
-	logger.Infof(ctx, "wiki ingest: doc %s chunks=%d content_len(raw=%d,truncated=%d)", knowledgeID, len(chunks), rawRuneCount, len([]rune(content)))
+	logger.Infof(ctx, "wiki ingest: doc %s chunks=%d content_len(raw=%d,truncated=%d)", knowledgeID, len(chunks), rawRuneCount, len([]rune(retractContent)))
 
 	// Refuse to run LLM-based extraction when the document carries no real
 	// text — e.g. a scanned PDF whose pages were converted to images but where
@@ -1238,6 +1243,48 @@ func (s *wikiIngestService) mapOneDocument(
 	sourceRef := knowledgeID
 	oldPageSlugs := s.getExistingPageSlugsForKnowledge(ctx, payload.KnowledgeBaseID, knowledgeID)
 
+	// Segment decision: tokenBudget > 0 derives the effective char cap from
+	// content density (auto mode, one setting serves Chinese and English
+	// books); otherwise the manual cap applies as-is. Documents at or under
+	// the cap keep the legacy single-shot path untouched; longer ones are
+	// partitioned and processed map-reduce style.
+	maxChars, tokenBudget := s.segmentConfig(ctx)
+	segments, multi, effectiveMax, segMode := planSegmentation(rawRuneCount, content, chunks, maxChars, tokenBudget)
+	var pass0Segments []contentSegment
+	extractionContent := content
+	if multi {
+		segSpan := s.tracker().BeginSubSpan(ctx, wikiSpan, "postprocess.wiki.segments", types.SpanKindSubSpan, types.JSONMap{
+			"mode":                segMode,
+			"effective_max_chars": effectiveMax,
+			"raw_chars":           rawRuneCount,
+		})
+		s.tracker().EndSpan(ctx, segSpan, types.JSONMap{
+			"segments":       len(segments),
+			"segment_ranges": segmentRuneRanges(segments),
+		})
+		logger.Infof(ctx, "wiki ingest: doc %s multi-segment mode=%s effective_max=%d raw=%d segments=%d",
+			knowledgeID, segMode, effectiveMax, rawRuneCount, len(segments))
+
+		// The caller owns DocTitle: the segmenter leaves it empty and
+		// renderSegmentHeader needs the book name to phrase the header.
+		for i := range segments {
+			segments[i].DocTitle = docTitle
+		}
+		// extractCandidateSlugs has no per-segment header of its own, so the
+		// Pass 0 copies carry the shared header in front of the text.
+		// generateSummaryMultiSegment prepends the header itself during its
+		// map phase, so it receives the plain segments (no double header).
+		pass0Segments = make([]contentSegment, len(segments))
+		for i, seg := range segments {
+			seg.Content = renderSegmentHeader(seg, docTitle) + segJoinNewline + seg.Content
+			pass0Segments[i] = seg
+		}
+		// The legacy single-shot fallback keeps its historical truncation
+		// cap: it was built for at most maxContentForWiki chars and must not
+		// receive a multi-million-char blob.
+		extractionContent = retractContent
+	}
+
 	// Pass 0: lightweight candidate slug extraction (skeleton only).
 	// On failure we fall back to the legacy single-shot extractor so the doc
 	// still gets ingested, just without chunk-level citations.
@@ -1252,11 +1299,15 @@ func (s *wikiIngestService) mapOneDocument(
 		"content_chars": utf8.RuneCountInString(content),
 		"old_pages":     len(oldPageSlugs),
 	})
-	extractedEntities, extractedConcepts, slugItems, err = s.extractCandidateSlugs(ctx, chatModel, payload.KnowledgeBaseID, content, lang, oldPageSlugs, batchCtx)
+	if multi {
+		extractedEntities, extractedConcepts, slugItems, err = s.extractCandidateSlugsMultiSegment(ctx, chatModel, payload.KnowledgeBaseID, pass0Segments, lang, oldPageSlugs, batchCtx)
+	} else {
+		extractedEntities, extractedConcepts, slugItems, err = s.extractCandidateSlugs(ctx, chatModel, payload.KnowledgeBaseID, content, lang, oldPageSlugs, batchCtx)
+	}
 	if err != nil {
 		logger.Warnf(ctx, "wiki ingest: pass 0 failed for %s (%v) — falling back to legacy extractor", knowledgeID, err)
 		pass0Failed = true
-		extractedEntities, extractedConcepts, slugItems, err = s.extractEntitiesAndConceptsNoUpsert(ctx, chatModel, payload.KnowledgeBaseID, content, lang, oldPageSlugs, batchCtx)
+		extractedEntities, extractedConcepts, slugItems, err = s.extractEntitiesAndConceptsNoUpsert(ctx, chatModel, payload.KnowledgeBaseID, extractionContent, lang, oldPageSlugs, batchCtx)
 		if err != nil {
 			logger.Warnf(ctx, "wiki ingest: legacy fallback also failed for %s: %v", knowledgeID, err)
 			s.tracker().FailSpan(ctx, extractSpan, "EXTRACT_FAILED", err.Error(), err)
@@ -1326,13 +1377,19 @@ func (s *wikiIngestService) mapOneDocument(
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		summaryContent, summaryErr = s.generateWithTemplate(ctx, chatModel, agent.WikiSummaryPrompt, map[string]string{
-			"Content":            content,
-			"Language":           lang,
-			"ExtractedSlugs":     slugListing,
-			"CustomInstructions": batchCtx.ContentInstructions,
-			"InstructionScope":   "wiki_content",
-		})
+		if multi {
+			// Map-reduce summary: per-segment partial summaries (segment
+			// headers prepended inside) merged by one reduce call.
+			summaryContent, summaryErr = s.generateSummaryMultiSegment(ctx, chatModel, segments, slugListing, lang, batchCtx)
+		} else {
+			summaryContent, summaryErr = s.generateWithTemplate(ctx, chatModel, agent.WikiSummaryPrompt, map[string]string{
+				"Content":            content,
+				"Language":           lang,
+				"ExtractedSlugs":     slugListing,
+				"CustomInstructions": batchCtx.ContentInstructions,
+				"InstructionScope":   "wiki_content",
+			})
+		}
 		if summaryErr != nil {
 			s.tracker().FailSpan(ctx, summarySpan, "SUMMARY_FAILED", summaryErr.Error(), summaryErr)
 		} else {
@@ -1551,7 +1608,7 @@ func (s *wikiIngestService) mapOneDocument(
 		updates = append(updates, SlugUpdate{
 			Slug:              oldSlug,
 			Type:              "retractStale",
-			RetractDocContent: content,
+			RetractDocContent: retractContent,
 			DocTitle:          docTitle,
 			KnowledgeID:       knowledgeID,
 			Language:          lang,
